@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 import structlog
+import aiohttp
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 from tenacity import (
     retry,
@@ -16,6 +17,7 @@ from tenacity import (
 
 from src.models import Post, Comment, ScrapingStats, Checkpoint
 from src.rate_limiter import RateLimiter, ExponentialBackoff
+from src.proxy_pool import ProxyPool
 from config.settings import settings
 
 logger = structlog.get_logger()
@@ -36,6 +38,8 @@ class YDLScraper:
         self.checkpoint = self._load_checkpoint()
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
+        self.proxy_pool = ProxyPool(settings.PROXY_LIST) if settings.USE_PROXY else None
+        self.current_proxy: Optional[str] = None
         
     def _load_checkpoint(self) -> Checkpoint:
         """Load checkpoint from file."""
@@ -57,18 +61,27 @@ class YDLScraper:
     
     async def __aenter__(self):
         """Async context manager entry."""
-        await self.start()
+        # Don't start browser automatically - it will be started if needed
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit."""
-        await self.close()
+        if self.browser or self.context:
+            await self.close()
     
     async def start(self):
         """Start browser and context."""
         playwright = await async_playwright().start()
+        
+        # Get proxy if enabled
+        if self.proxy_pool:
+            self.current_proxy = self.proxy_pool.get_proxy(random_selection=settings.PROXY_ROTATION)
+            if self.current_proxy:
+                logger.info("using_proxy", proxy=self.proxy_pool._mask_proxy(self.current_proxy))
+        
         self.browser = await playwright.chromium.launch(
-            headless=settings.HEADLESS
+            headless=settings.HEADLESS,
+            proxy={"server": self.current_proxy} if self.current_proxy else None
         )
         self.context = await self.browser.new_context(
             viewport={
@@ -78,7 +91,7 @@ class YDLScraper:
             user_agent=settings.UA_MOBILE,
             locale="zh-CN"
         )
-        logger.info("browser_started")
+        logger.info("browser_started", with_proxy=bool(self.current_proxy))
     
     async def close(self):
         """Close browser and context."""
@@ -234,10 +247,11 @@ class YDLScraper:
             self.stats.errors += 1
             return None
     
-    async def scrape_list_page(self, url: str = None) -> List[Post]:
-        """Scrape posts from list page."""
+    async def scrape_list_page(self, url: str = None, max_pages: int = 50) -> List[Post]:
+        """Scrape posts from list page with scrolling."""
         url = url or settings.TARGET_ROOT
         posts = []
+        seen_post_ids = set()
         
         try:
             page = await self.context.new_page()
@@ -252,31 +266,56 @@ class YDLScraper:
             
             self.stats.add_http_status(200)
             
-            # Extract initial posts from preloaded state
-            html = await page.content()
-            preloaded = self._extract_preloaded_state(html)
+            # Scroll and collect posts multiple times
+            empty_scroll_count = 0
+            max_empty_scrolls = 10
+            scroll_count = 0
             
-            if preloaded and "data" in preloaded:
-                data = preloaded["data"]
-                if "data" in data and "data" in data["data"]:
-                    posts_data = data["data"]["data"]
-                    
-                    for post_data in posts_data:
-                        try:
-                            post = Post.from_api_response(post_data, url)
-                            posts.append(post)
-                            self.stats.total_posts += 1
-                            self.stats.total_comments += len(post.comments)
-                            
-                            logger.info("post_parsed", post_id=post.post_id, comments=len(post.comments))
-                        except Exception as e:
-                            logger.error("post_parse_error", error=str(e), data=post_data)
-                            self.stats.errors += 1
+            while scroll_count < max_pages and empty_scroll_count < max_empty_scrolls:
+                # Extract posts from current page state
+                html = await page.content()
+                preloaded = self._extract_preloaded_state(html)
+                
+                posts_found_this_scroll = 0
+                
+                if preloaded and "data" in preloaded:
+                    data = preloaded["data"]
+                    if "data" in data and "data" in data["data"]:
+                        posts_data = data["data"]["data"]
+                        
+                        for post_data in posts_data:
+                            post_id = post_data.get("id")
+                            if post_id and post_id not in seen_post_ids:
+                                try:
+                                    post = Post.from_api_response(post_data, url)
+                                    posts.append(post)
+                                    seen_post_ids.add(post_id)
+                                    self.stats.total_posts += 1
+                                    self.stats.total_comments += len(post.comments)
+                                    posts_found_this_scroll += 1
+                                    
+                                    logger.info("post_parsed", post_id=post.post_id, comments=len(post.comments), total=len(posts))
+                                except Exception as e:
+                                    logger.error("post_parse_error", error=str(e), post_id=post_id)
+                                    self.stats.errors += 1
+                
+                if posts_found_this_scroll == 0:
+                    empty_scroll_count += 1
+                    logger.info("scroll_no_new_posts", empty_count=empty_scroll_count, total_posts=len(posts))
+                else:
+                    empty_scroll_count = 0
+                
+                # Scroll down to trigger loading more content
+                await self.rate_limiter.acquire()
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(2)  # Wait for content to load
+                
+                scroll_count += 1
+                
+                if scroll_count % 5 == 0:
+                    logger.info("scroll_progress", scrolls=scroll_count, posts=len(posts))
             
-            # Scroll to load more posts
-            logger.info("starting_scroll_load")
-            # Note: The site might not support infinite scroll on initial load
-            # We'll need to investigate pagination mechanism
+            logger.info("scroll_complete", total_scrolls=scroll_count, total_posts=len(posts))
             
             await page.close()
             
@@ -338,25 +377,114 @@ class YDLScraper:
         
         return posts
     
-    async def scrape_full(self) -> List[Post]:
-        """Scrape all available posts."""
-        logger.info("full_scrape_start")
+    async def scrape_full(self, max_pages: int = 500) -> List[Post]:
+        """Scrape all available posts using API."""
+        logger.info("full_scrape_start", max_pages=max_pages)
         
-        posts = await self.scrape_list_page()
-        
-        # Get detailed info for all posts
-        post_ids = [p.post_id for p in posts]
-        detailed_posts = await self.scrape_post_details(post_ids)
+        # Use API scraping instead of browser-based scraping (much faster)
+        posts = await self.scrape_via_api(start_page=1, max_pages=max_pages, per_page=10)
         
         self.checkpoint.last_run_time = datetime.now()
-        if detailed_posts:
-            max_post = max(detailed_posts, key=lambda p: p.post_id)
+        if posts:
+            max_post = max(posts, key=lambda p: p.post_id)
             self.checkpoint.last_post_id = max_post.post_id
             self.checkpoint.last_post_time = max_post.publish_time
-        self.checkpoint.total_posts_scraped += len(detailed_posts)
+        self.checkpoint.total_posts_scraped += len(posts)
         self._save_checkpoint()
         
-        return detailed_posts
+        return posts
+    
+    async def scrape_via_api(self, start_page: int = 1, max_pages: int = 100, per_page: int = 10) -> List[Post]:
+        """
+        Scrape posts using API directly (faster and more reliable).
+        
+        Args:
+            start_page: Starting page number
+            max_pages: Maximum number of pages to scrape
+            per_page: Posts per page
+        
+        Returns:
+            List of Post objects
+        """
+        posts = []
+        seen_post_ids = set()
+        api_url = "https://api.ydl.com/api/ask/list-old"
+        
+        headers = {
+            "User-Agent": settings.UA_MOBILE,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": "https://m.ydl.com/ask",
+            "Origin": "https://m.ydl.com"
+        }
+        
+        logger.info("api_scrape_start", start_page=start_page, max_pages=max_pages, per_page=per_page)
+        
+        async with aiohttp.ClientSession() as session:
+            for page_num in range(start_page, start_page + max_pages):
+                await self.rate_limiter.acquire()
+                
+                params = {
+                    "page": page_num,
+                    "perPageRows": per_page,
+                    "tab": 1
+                }
+                
+                try:
+                    async with session.get(api_url, params=params, headers=headers) as response:
+                        if response.status != 200:
+                            self.stats.add_http_status(response.status)
+                            logger.warning("api_request_failed", page=page_num, status=response.status)
+                            
+                            if response.status == 429:  # Too many requests
+                                logger.warning("rate_limited", waiting=60)
+                                await asyncio.sleep(60)
+                                continue
+                            
+                            break
+                        
+                        self.stats.add_http_status(200)
+                        
+                        data = await response.json()
+                        
+                        if data.get("code") != "200":
+                            logger.warning("api_error", page=page_num, code=data.get("code"), msg=data.get("msg"))
+                            break
+                        
+                        posts_data = data.get("data", {}).get("data", [])
+                        
+                        if not posts_data:
+                            logger.info("no_more_posts", page=page_num)
+                            break
+                        
+                        page_post_count = 0
+                        for post_data in posts_data:
+                            post_id = post_data.get("id")
+                            if post_id and post_id not in seen_post_ids:
+                                try:
+                                    post = Post.from_api_response(post_data, f"{api_url}?page={page_num}")
+                                    posts.append(post)
+                                    seen_post_ids.add(post_id)
+                                    self.stats.total_posts += 1
+                                    self.stats.total_comments += len(post.comments)
+                                    page_post_count += 1
+                                except Exception as e:
+                                    logger.error("post_parse_error", error=str(e), post_id=post_id)
+                                    self.stats.errors += 1
+                        
+                        logger.info("page_scraped", page=page_num, posts_this_page=page_post_count, total_posts=len(posts))
+                        
+                        # Log progress every 10 pages
+                        if page_num % 10 == 0:
+                            logger.info("scrape_progress", page=page_num, total_posts=len(posts))
+                        
+                except Exception as e:
+                    logger.error("api_request_error", page=page_num, error=str(e))
+                    self.stats.errors += 1
+                    continue
+        
+        logger.info("api_scrape_complete", total_pages=page_num - start_page + 1, total_posts=len(posts))
+        return posts
     
     def get_stats(self) -> ScrapingStats:
         """Get scraping statistics."""

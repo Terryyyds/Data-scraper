@@ -1,0 +1,17 @@
+# Proxy list - one proxy per line
+# Format: http://host:port or http://user:pass@host:port or socks5://host:port
+# 
+# Free proxies (often unreliable, for testing only):
+# You should replace these with your own paid proxy service
+#
+# Examples:
+# http://proxy1.example.com:8080
+# http://username:password@proxy2.example.com:3128
+# socks5://proxy3.example.com:1080
+#
+# For production, consider using services like:
+# - Bright Data: https://brightdata.com/
+# - Oxylabs: https://oxylabs.io/
+# - Smartproxy: https://smartproxy.com/
+# - ScraperAPI: https://www.scraperapi.com/
+

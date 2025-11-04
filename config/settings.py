@@ -1,7 +1,7 @@
 """Configuration settings for the scraper."""
 import os
 from typing import Optional
-from pydantic import BaseSettings
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     HEADLESS: bool = True
     VIEWPORT_WIDTH: int = 375
     VIEWPORT_HEIGHT: int = 812
+    
+    # Proxy settings
+    USE_PROXY: bool = False
+    PROXY_LIST: str = ""  # Comma-separated proxy list or file path
+    PROXY_ROTATION: bool = True  # Rotate proxies
     
     class Config:
         env_file = ".env"

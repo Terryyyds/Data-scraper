@@ -65,3 +65,10 @@ tmp/
 temp/
 *.tmp
 
+
+# Test files
+test_api.py
+api_response_*.json
+captured_requests.json
+scrape_log.txt
+full_scrape.log

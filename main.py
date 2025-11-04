@@ -19,7 +19,7 @@ structlog.configure(
         structlog.processors.StackInfoRenderer(),
         structlog.dev.ConsoleRenderer()
     ],
-    wrapper_class=structlog.make_filtering_bound_logger(logging_level=20),
+    wrapper_class=structlog.make_filtering_bound_logger(20),
     context_class=dict,
     logger_factory=structlog.PrintLoggerFactory(),
     cache_logger_on_first_use=False
@@ -28,15 +28,30 @@ structlog.configure(
 logger = structlog.get_logger()
 
 
-async def main_scrape(mode: str = "full", export: bool = True):
+async def main_scrape(mode: str = "full", export: bool = True, start_date: str = None, max_pages: int = 500):
     """
     Main scraping function.
     
     Args:
         mode: "full" for complete scrape, "incremental" for updates only
         export: Whether to export dataset at the end
+        start_date: Filter posts from this date (YYYY-MM-DD format)
+        max_pages: Maximum pages to scrape
     """
-    logger.info("scrape_started", mode=mode, target=settings.TARGET_ROOT)
+    from datetime import datetime
+    from src.date_utils import filter_posts_by_date
+    
+    logger.info("scrape_started", mode=mode, target=settings.TARGET_ROOT, start_date=start_date, max_pages=max_pages)
+    
+    # Parse start date
+    filter_start_date = None
+    if start_date:
+        try:
+            filter_start_date = datetime.strptime(start_date, "%Y-%m-%d")
+            logger.info("date_filter_enabled", start_date=filter_start_date)
+        except ValueError:
+            logger.error("invalid_start_date", start_date=start_date)
+            return
     
     # Initialize components
     store = DataStore(data_dir=settings.DATA_DIR)
@@ -49,9 +64,20 @@ async def main_scrape(mode: str = "full", export: bool = True):
             if mode == "incremental":
                 posts = await scraper.scrape_incremental()
             else:
-                posts = await scraper.scrape_full()
+                posts = await scraper.scrape_full(max_pages=max_pages)
             
-            logger.info("scrape_completed", posts_count=len(posts))
+            logger.info("scrape_completed", posts_count=len(posts), posts_before_filter=len(posts))
+            
+            # Apply date filter if specified
+            if filter_start_date and posts:
+                posts_before = len(posts)
+                posts = filter_posts_by_date(posts, filter_start_date)
+                logger.info("date_filter_applied", 
+                           before=posts_before, 
+                           after=len(posts), 
+                           filtered_out=posts_before - len(posts))
+            
+            logger.info("final_posts_count", posts_count=len(posts))
             
             # Save posts
             if posts:
@@ -185,6 +211,19 @@ def cli():
         help=f"数据存储目录 (默认: {settings.DATA_DIR})"
     )
     
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        help="起始日期过滤 (格式: YYYY-MM-DD, 例如: 2025-01-01)"
+    )
+    
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=500,
+        help="最大抓取页数 (默认: 500)"
+    )
+    
     args = parser.parse_args()
     
     # Update settings
@@ -208,7 +247,9 @@ def cli():
     try:
         asyncio.run(main_scrape(
             mode=args.mode,
-            export=not args.no_export
+            export=not args.no_export,
+            start_date=args.start_date,
+            max_pages=args.max_pages
         ))
     except KeyboardInterrupt:
         logger.info("scrape_interrupted")
