@@ -377,12 +377,34 @@ class YDLScraper:
         
         return posts
     
-    async def scrape_full(self, max_pages: int = 500) -> List[Post]:
+    async def scrape_full(self, max_pages: int = 500, max_posts: int = None, stop_date: datetime = None, start_page: int = None) -> List[Post]:
         """Scrape all available posts using API."""
-        logger.info("full_scrape_start", max_pages=max_pages)
+        # If start_page not specified, calculate from existing data
+        existing_posts = self.checkpoint.total_posts_scraped
+        if start_page is None:
+            # Estimate start page based on existing posts
+            # Each page has ~10 posts, so if we have 5000 posts, we've done ~500 pages
+            estimated_page = (existing_posts // 10) + 1
+            start_page = estimated_page
+            logger.info("auto_start_page", existing_posts=existing_posts, estimated_page=estimated_page)
+        
+        # Adjust max_posts if we already have some posts
+        # If user wants 30000 total and we have 5000, we only need to scrape 25000 more
+        remaining_posts = None
+        if max_posts and existing_posts > 0:
+            remaining_posts = max_posts - existing_posts
+            if remaining_posts <= 0:
+                logger.info("target_posts_already_reached", existing=existing_posts, target=max_posts)
+                return []
+            logger.info("adjusted_max_posts", existing=existing_posts, target=max_posts, remaining=remaining_posts)
+        
+        logger.info("full_scrape_start", start_page=start_page, max_pages=max_pages, max_posts=remaining_posts, stop_date=stop_date)
         
         # Use API scraping instead of browser-based scraping (much faster)
-        posts = await self.scrape_via_api(start_page=1, max_pages=max_pages, per_page=10)
+        # Calculate actual max_pages: if we start at page 500 and want to do 3000 more, we need to go to page 3500
+        actual_max_pages = max_pages if start_page == 1 else (start_page + max_pages - 1)
+        posts = await self.scrape_via_api(start_page=start_page, max_pages=actual_max_pages, per_page=10,
+                                          max_posts=remaining_posts, stop_date=stop_date)
         
         self.checkpoint.last_run_time = datetime.now()
         if posts:
@@ -394,7 +416,8 @@ class YDLScraper:
         
         return posts
     
-    async def scrape_via_api(self, start_page: int = 1, max_pages: int = 100, per_page: int = 10) -> List[Post]:
+    async def scrape_via_api(self, start_page: int = 1, max_pages: int = 100, per_page: int = 10, 
+                            max_posts: int = None, stop_date: datetime = None) -> List[Post]:
         """
         Scrape posts using API directly (faster and more reliable).
         
@@ -402,10 +425,14 @@ class YDLScraper:
             start_page: Starting page number
             max_pages: Maximum number of pages to scrape
             per_page: Posts per page
+            max_posts: Stop when reaching this many posts (optional)
+            stop_date: Stop when reaching posts before this date (optional)
         
         Returns:
             List of Post objects
         """
+        from src.date_utils import parse_chinese_date
+        
         posts = []
         seen_post_ids = set()
         api_url = "https://api.ydl.com/api/ask/list-old"
@@ -418,7 +445,8 @@ class YDLScraper:
             "Origin": "https://m.ydl.com"
         }
         
-        logger.info("api_scrape_start", start_page=start_page, max_pages=max_pages, per_page=per_page)
+        logger.info("api_scrape_start", start_page=start_page, max_pages=max_pages, per_page=per_page,
+                   max_posts=max_posts, stop_date=stop_date)
         
         async with aiohttp.ClientSession() as session:
             for page_num in range(start_page, start_page + max_pages):
@@ -458,21 +486,48 @@ class YDLScraper:
                             break
                         
                         page_post_count = 0
+                        should_stop = False
+                        
                         for post_data in posts_data:
                             post_id = post_data.get("id")
                             if post_id and post_id not in seen_post_ids:
                                 try:
                                     post = Post.from_api_response(post_data, f"{api_url}?page={page_num}")
+                                    
+                                    # Check stop conditions
+                                    if stop_date:
+                                        post_date = parse_chinese_date(post.publish_time)
+                                        if post_date and post_date < stop_date:
+                                            logger.info("stop_condition_met_date", 
+                                                       post_date=post_date, 
+                                                       stop_date=stop_date,
+                                                       total_posts=len(posts))
+                                            should_stop = True
+                                            break
+                                    
                                     posts.append(post)
                                     seen_post_ids.add(post_id)
                                     self.stats.total_posts += 1
                                     self.stats.total_comments += len(post.comments)
                                     page_post_count += 1
+                                    
+                                    # Check max posts limit
+                                    if max_posts and len(posts) >= max_posts:
+                                        logger.info("stop_condition_met_count", 
+                                                   total_posts=len(posts),
+                                                   max_posts=max_posts)
+                                        should_stop = True
+                                        break
+                                        
                                 except Exception as e:
                                     logger.error("post_parse_error", error=str(e), post_id=post_id)
                                     self.stats.errors += 1
                         
                         logger.info("page_scraped", page=page_num, posts_this_page=page_post_count, total_posts=len(posts))
+                        
+                        # Stop if condition met
+                        if should_stop:
+                            break
                         
                         # Log progress every 10 pages
                         if page_num % 10 == 0:

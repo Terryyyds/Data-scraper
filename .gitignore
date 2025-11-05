@@ -48,6 +48,8 @@ logs/
 # Data
 data/
 !data/.gitkeep
+!data/checkpoint.json
+!data/seen_ids.txt
 
 # Environment
 .env
@@ -58,7 +60,8 @@ playwright-browsers/
 .playwright/
 
 # Checkpoints
-checkpoint.json
+# Allow checkpoint.json for resuming scraping
+# checkpoint.json
 
 # Temporary
 tmp/

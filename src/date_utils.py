@@ -56,6 +56,25 @@ def parse_chinese_date(date_str: str, reference_date: datetime = None) -> Option
                 day_before = reference_date - timedelta(days=2)
                 return day_before.replace(hour=hour, minute=minute, second=0, microsecond=0)
         
+        # Format: "24-12-20 09:45" (YY-MM-DD HH:MM) - 2-digit year
+        elif re.match(r'^\d{2}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}', date_str):
+            parts = date_str.split()
+            date_part = parts[0]
+            time_part = parts[1] if len(parts) > 1 else "00:00"
+            
+            date_parts = date_part.split('-')
+            if len(date_parts) == 3:
+                year_2digit, month, day = map(int, date_parts)
+                hour, minute = map(int, time_part.split(':'))
+                
+                # Convert 2-digit year to 4-digit (assume 20xx for 00-99)
+                if year_2digit < 100:
+                    year = 2000 + year_2digit
+                else:
+                    year = year_2digit
+                
+                return datetime(year, month, day, hour, minute)
+        
         # Format: "10-31 20:56" (MM-DD HH:MM)
         elif re.match(r'^\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}', date_str):
             parts = date_str.split()

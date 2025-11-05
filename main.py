@@ -28,7 +28,8 @@ structlog.configure(
 logger = structlog.get_logger()
 
 
-async def main_scrape(mode: str = "full", export: bool = True, start_date: str = None, max_pages: int = 500):
+async def main_scrape(mode: str = "full", export: bool = True, start_date: str = None, 
+                     max_pages: int = 500, max_posts: int = None, stop_date: str = None):
     """
     Main scraping function.
     
@@ -37,13 +38,16 @@ async def main_scrape(mode: str = "full", export: bool = True, start_date: str =
         export: Whether to export dataset at the end
         start_date: Filter posts from this date (YYYY-MM-DD format)
         max_pages: Maximum pages to scrape
+        max_posts: Stop when reaching this many posts
+        stop_date: Stop when reaching posts before this date (YYYY-MM-DD format)
     """
     from datetime import datetime
     from src.date_utils import filter_posts_by_date
     
-    logger.info("scrape_started", mode=mode, target=settings.TARGET_ROOT, start_date=start_date, max_pages=max_pages)
+    logger.info("scrape_started", mode=mode, target=settings.TARGET_ROOT, start_date=start_date, 
+               max_pages=max_pages, max_posts=max_posts, stop_date=stop_date)
     
-    # Parse start date
+    # Parse start date (for filtering after scrape)
     filter_start_date = None
     if start_date:
         try:
@@ -51,6 +55,16 @@ async def main_scrape(mode: str = "full", export: bool = True, start_date: str =
             logger.info("date_filter_enabled", start_date=filter_start_date)
         except ValueError:
             logger.error("invalid_start_date", start_date=start_date)
+            return
+    
+    # Parse stop date (for stopping during scrape)
+    stop_date_obj = None
+    if stop_date:
+        try:
+            stop_date_obj = datetime.strptime(stop_date, "%Y-%m-%d")
+            logger.info("stop_date_enabled", stop_date=stop_date_obj)
+        except ValueError:
+            logger.error("invalid_stop_date", stop_date=stop_date)
             return
     
     # Initialize components
@@ -64,7 +78,7 @@ async def main_scrape(mode: str = "full", export: bool = True, start_date: str =
             if mode == "incremental":
                 posts = await scraper.scrape_incremental()
             else:
-                posts = await scraper.scrape_full(max_pages=max_pages)
+                posts = await scraper.scrape_full(max_pages=max_pages, max_posts=max_posts, stop_date=stop_date_obj)
             
             logger.info("scrape_completed", posts_count=len(posts), posts_before_filter=len(posts))
             
@@ -220,8 +234,20 @@ def cli():
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=500,
-        help="最大抓取页数 (默认: 500)"
+        default=3000,
+        help="最大抓取页数 (默认: 3000)"
+    )
+    
+    parser.add_argument(
+        "--max-posts",
+        type=int,
+        help="最大帖子数，达到后停止 (例如: 30000)"
+    )
+    
+    parser.add_argument(
+        "--stop-date",
+        type=str,
+        help="停止日期，遇到此日期之前的帖子时停止 (格式: YYYY-MM-DD, 例如: 2024-01-01)"
     )
     
     args = parser.parse_args()
@@ -249,7 +275,9 @@ def cli():
             mode=args.mode,
             export=not args.no_export,
             start_date=args.start_date,
-            max_pages=args.max_pages
+            max_pages=args.max_pages,
+            max_posts=args.max_posts,
+            stop_date=args.stop_date
         ))
     except KeyboardInterrupt:
         logger.info("scrape_interrupted")
